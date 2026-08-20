@@ -1,0 +1,14 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# SPA fallback — this is a client-rendered single-page app with its own view
+# routing (not URL-based), so every path should serve index.html.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
