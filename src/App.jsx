@@ -490,9 +490,47 @@ export default function Heurisko() {
   const [selected, setSelected] = useState(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [authIntent, setAuthIntent] = useState(null); // 'register' | 'claim' | null
-  const [account, setAccount] = useState(null); // { name, email, role }
+  const [account, setAccount] = useState(null); // { id, name, email, role, isAdmin }
+  const [authLoaded, setAuthLoaded] = useState(false);
   const [emergencyOpen, setEmergencyOpen] = useState(false);
-  const [isAdminAuthed, setIsAdminAuthed] = useState(false);
+
+  // Real Supabase Auth session — replaces the old "type anything, get logged
+  // in" fake auth. isAdmin comes from real user_metadata on the Supabase
+  // account (set by you in the Supabase dashboard, not by anything in this
+  // app's UI) — see README "Making an account an admin."
+  const sessionToAccount = (session) => {
+    if (!session || !session.user) return null;
+    return {
+      id: session.user.id,
+      email: session.user.email,
+      name: session.user.user_metadata?.full_name || session.user.email.split("@")[0],
+      role: "professional",
+      isAdmin: session.user.user_metadata?.is_admin === true,
+    };
+  };
+
+  React.useEffect(() => {
+    let cancelled = false;
+    supabase.auth.getSession().then(({ data }) => {
+      if (cancelled) return;
+      const acct = sessionToAccount(data.session);
+      setAccount(acct);
+      setIsLoggedIn(!!acct);
+      setAuthLoaded(true);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      const acct = sessionToAccount(session);
+      setAccount(acct);
+      setIsLoggedIn(!!acct);
+      setAuthLoaded(true);
+      if (acct && (authIntent === "register" || authIntent === "claim")) {
+        setView(authIntent);
+        setAuthIntent(null);
+      }
+    });
+    return () => { cancelled = true; listener?.subscription?.unsubscribe(); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const isAdminAuthed = account?.isAdmin === true;
 
   // Shared, persisted state — real data, visible to everyone who opens this link.
   const [directory, setDirectoryRaw] = useState([]);
@@ -573,7 +611,18 @@ export default function Heurisko() {
     const id = Date.now() + Math.random();
     setAdminQueue((prev) => [{ id, ...entry }, ...prev]);
     if (entry.directoryEntry) {
-      setDirectory((prev) => [...prev, { ...entry.directoryEntry, id, _queueId: id, _ownerEmail: account?.email || null, hidden: false, flaggedForReview: false }]);
+      // One profile per real account (AUTH-04) — matched by the actual
+      // authenticated Supabase user id, not a self-reported email string that
+      // anyone could type. Re-submitting updates your existing entry instead
+      // of silently creating a second one you'd then own two of.
+      const existing = directory.find((d) => d._ownerId && account?.id && d._ownerId === account.id);
+      if (existing) {
+        setDirectory((prev) => prev.map((d) => (d.id === existing.id
+          ? { ...entry.directoryEntry, id: existing.id, _queueId: id, _ownerId: account.id, hidden: d.hidden, flaggedForReview: d.flaggedForReview }
+          : d)));
+      } else {
+        setDirectory((prev) => [...prev, { ...entry.directoryEntry, id, _queueId: id, _ownerId: account?.id || null, hidden: false, flaggedForReview: false }]);
+      }
     }
   };
 
@@ -584,11 +633,11 @@ export default function Heurisko() {
     const id = Date.now() + Math.random();
     if (r.status === "external") {
       setExternalListings((prev) => prev.filter((e) => e !== r));
-      setDirectory((prev) => [...prev, { type: r.type, name: r.name, title: r.title, status: "pending", location: r.location, languages: r.languages, exp: r.exp, fee: r.fee, initials: r.initials, modes: r.modes || [], concerns: r.concerns || [], id, _queueId: id, _ownerEmail: account?.email || null, hidden: false, flaggedForReview: false }]);
+      setDirectory((prev) => [...prev, { type: r.type, name: r.name, title: r.title, status: "pending", location: r.location, languages: r.languages, exp: r.exp, fee: r.fee, initials: r.initials, modes: r.modes || [], concerns: r.concerns || [], id, _queueId: id, _ownerId: account?.id || null, hidden: false, flaggedForReview: false }]);
     } else {
       // Matched by stable id, not name — two entries can legitimately share a
       // display name, and name-matching would silently update the wrong one.
-      setDirectory((prev) => prev.map((d) => (d.id === r.id ? { ...d, status: "pending", _queueId: id, _ownerEmail: account?.email || d._ownerEmail } : d)));
+      setDirectory((prev) => prev.map((d) => (d.id === r.id ? { ...d, status: "pending", _queueId: id, _ownerId: account?.id || d._ownerId } : d)));
     }
     setAdminQueue((prev) => [{
       id, name: r.name, type: r.type, submittedDate: new Date().toISOString().slice(0, 10),
@@ -654,24 +703,8 @@ export default function Heurisko() {
     setView(tag);
   };
 
-  const handleAuthenticated = (acct) => {
-    setIsLoggedIn(true);
-    // If this email has signed up before, use the real name on file instead of
-    // whatever guess the login form derived from the email prefix — otherwise a
-    // returning "Log in" quietly renames a person on their own dashboard.
-    const resolvedName = accountsDirectory[acct.email] || acct.name;
-    const finalAcct = { role: "professional", ...acct, name: resolvedName };
-    setAccount(finalAcct);
-    setAccountsDirectory((prev) => ({ ...prev, [acct.email]: resolvedName }));
-    if (authIntent === "register") setView("register");
-    else if (authIntent === "claim") setView("claim");
-    else setView("home");
-    setAuthIntent(null);
-  };
-
   const logOut = () => {
-    setIsLoggedIn(false);
-    setAccount(null);
+    supabase.auth.signOut();
     setView("home");
   };
 
@@ -802,7 +835,6 @@ export default function Heurisko() {
         <AuthView
           intent={authIntent}
           claimTarget={selected}
-          onAuthenticated={handleAuthenticated}
           onCancel={() => { setAuthIntent(null); setView("home"); }}
         />
       ) : view === "register" ? (
@@ -819,22 +851,33 @@ export default function Heurisko() {
       ) : view === "about" ? (
         <AboutView />
       ) : view === "contact" ? (
-        <ContactView isAdminAuthed={isAdminAuthed} onAdminAuthed={() => { setIsAdminAuthed(true); setView("admin"); }} />
+        <ContactView />
       ) : view === "admin" ? (
-        <AdminView
-          queue={adminQueue}
-          setQueue={setAdminQueue}
-          auditTrail={auditTrail}
-          setAuditTrail={setAuditTrail}
-          directory={directory}
-          setDirectory={setDirectory}
-          onDeleteDirectoryEntry={deleteDirectoryEntry}
-          onSetVisibility={setDirectoryEntryVisibility}
-          onToggleFlag={toggleDirectoryEntryFlag}
-          discoveryQueue={discoveryQueue}
-          setDiscoveryQueue={setDiscoveryQueue}
-          onExit={() => { setIsAdminAuthed(false); setView("home"); }}
-        />
+        isAdminAuthed ? (
+          <AdminView
+            queue={adminQueue}
+            setQueue={setAdminQueue}
+            auditTrail={auditTrail}
+            setAuditTrail={setAuditTrail}
+            directory={directory}
+            setDirectory={setDirectory}
+            onDeleteDirectoryEntry={deleteDirectoryEntry}
+            onSetVisibility={setDirectoryEntryVisibility}
+            onToggleFlag={toggleDirectoryEntryFlag}
+            discoveryQueue={discoveryQueue}
+            setDiscoveryQueue={setDiscoveryQueue}
+            onExit={() => setView("home")}
+          />
+        ) : (
+          // Real gate, checked here too (not just hidden from nav) — visiting
+          // /admin directly without a real admin account goes nowhere.
+          <main style={{ maxWidth: 480, margin: "0 auto", padding: "100px 24px", textAlign: "center" }}>
+            <p style={{ fontSize: 14, color: c.gray600, marginBottom: 16 }}>
+              {authLoaded ? "This account isn't an admin." : "Checking your session…"}
+            </p>
+            <Button variant="secondary" onClick={() => setView("home")}>Back to home</Button>
+          </main>
+        )
       ) : (
         <ClaimView r={selected} onBack={() => setView("profile")} onSubmitClaim={submitClaim} />
       )}
@@ -1199,52 +1242,95 @@ function TextField({ label, required, area, placeholder, hint, value, onChange, 
 
 const PRO_STEPS = ["Account type", "Basic info", "Credentials", "Services", "Review"];
 
-function AuthView({ intent, claimTarget, onAuthenticated, onCancel }) {
+function AuthView({ intent, claimTarget, onCancel }) {
   const [mode, setMode] = useState("signup"); // 'signup' | 'login'
-  const [stage, setStage] = useState("form"); // 'form' | 'verify'
+  const [stage, setStage] = useState("form"); // 'form' | 'check-email' | 'reset-sent'
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   const intentCopy = {
-    register: "Creating a professional or institution profile needs a verified account first — it's what lets you edit your own listing later and keeps the verification queue tied to a real person.",
+    register: "Creating a professional or institution profile needs a real, verified account first — it's what lets you edit your own listing later and keeps the verification queue tied to a real person.",
     claim: claimTarget ? `Claiming ${claimTarget.name}'s profile needs a verified account, so we know who's requesting edit access.` : "Claiming a profile needs a verified account.",
   };
 
-  const submitForm = (e) => {
+  const submitForm = async (e) => {
     e.preventDefault();
     if (!email.trim() || !password.trim() || (mode === "signup" && !name.trim())) {
       setError("Fill in every field before continuing.");
       return;
     }
     setError("");
-    if (mode === "signup") setStage("verify");
-    else onAuthenticated({ name: email.split("@")[0], email });
+    setSubmitting(true);
+
+    if (mode === "signup") {
+      const { error: signUpError } = await supabase.auth.signUp({
+        email: email.trim(),
+        password,
+        options: {
+          data: { full_name: name.trim() },
+          emailRedirectTo: window.location.origin,
+        },
+      });
+      setSubmitting(false);
+      if (signUpError) { setError(signUpError.message); return; }
+      setStage("check-email");
+    } else {
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
+      setSubmitting(false);
+      // Real failure for a wrong password or unknown account — this used to
+      // always succeed no matter what was typed. onAuthStateChange (root
+      // component) picks up a successful login and navigates automatically.
+      if (signInError) setError("Incorrect email or password.");
+    }
   };
 
-  const confirmVerify = () => onAuthenticated({ name, email });
+  const sendPasswordReset = async () => {
+    if (!email.trim()) { setError("Enter your email above first, then click 'Forgot password'."); return; }
+    setError("");
+    setSubmitting(true);
+    const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+      redirectTo: window.location.origin,
+    });
+    setSubmitting(false);
+    if (resetError) { setError(resetError.message); return; }
+    setStage("reset-sent");
+  };
 
-  if (stage === "verify") {
+  if (stage === "check-email") {
     return (
       <main style={{ maxWidth: 440, margin: "0 auto", padding: "80px 24px", textAlign: "center" }}>
         <div style={{ width: 52, height: 52, borderRadius: "50%", background: c.navyTint, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 18px" }}>
           <Mail size={22} color={c.navy} />
         </div>
-        <h1 style={{ fontFamily: fonts.display, fontSize: 22, color: c.ink, marginBottom: 10, fontWeight: 500 }}>Verify your email</h1>
+        <h1 style={{ fontFamily: fonts.display, fontSize: 22, color: c.ink, marginBottom: 10, fontWeight: 500 }}>Check your email</h1>
         <p style={{ fontSize: 13.5, color: c.gray600, lineHeight: 1.7, marginBottom: 22 }}>
-          We've sent a 6-digit code to <strong>{email}</strong>. Enter it below to confirm it's you.
+          We've sent a real confirmation link to <strong>{email}</strong>. Click it, and you'll be brought back here already signed in — no code to type.
         </p>
-        <input
-          placeholder="000000"
-          maxLength={6}
-          style={{ width: 140, textAlign: "center", letterSpacing: "0.3em", fontFamily: fonts.mono, fontSize: 18, border: `1px solid ${c.gray300}`, borderRadius: 8, padding: "10px 0", marginBottom: 20 }}
-        />
-        <div>
-          <Button variant="primary" onClick={confirmVerify}>Confirm and continue</Button>
-        </div>
-        <button onClick={() => setStage("form")} style={{ background: "none", border: "none", color: c.gray600, fontSize: 12.5, marginTop: 16, cursor: "pointer" }}>
+        <button onClick={() => setStage("form")} style={{ background: "none", border: "none", color: c.gray600, fontSize: 12.5, cursor: "pointer" }}>
           Use a different email
+        </button>
+      </main>
+    );
+  }
+
+  if (stage === "reset-sent") {
+    return (
+      <main style={{ maxWidth: 440, margin: "0 auto", padding: "80px 24px", textAlign: "center" }}>
+        <div style={{ width: 52, height: 52, borderRadius: "50%", background: c.navyTint, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 18px" }}>
+          <Mail size={22} color={c.navy} />
+        </div>
+        <h1 style={{ fontFamily: fonts.display, fontSize: 22, color: c.ink, marginBottom: 10, fontWeight: 500 }}>Check your email</h1>
+        <p style={{ fontSize: 13.5, color: c.gray600, lineHeight: 1.7, marginBottom: 22 }}>
+          If an account exists for <strong>{email}</strong>, a password reset link is on its way.
+        </p>
+        <button onClick={() => setStage("form")} style={{ background: "none", border: "none", color: c.gray600, fontSize: 12.5, cursor: "pointer" }}>
+          Back to sign in
         </button>
       </main>
     );
@@ -1297,10 +1383,16 @@ function AuthView({ intent, claimTarget, onAuthenticated, onCancel }) {
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 8 characters" style={{ width: "100%", border: `1px solid ${c.gray300}`, borderRadius: 8, padding: "10px 12px", fontFamily: fonts.body, fontSize: 14 }} />
         </div>
 
-        {error && <p style={{ fontSize: 12.5, color: c.red, marginTop: 8 }}>{error}</p>}
+        {mode === "login" && (
+          <button type="button" onClick={sendPasswordReset} style={{ background: "none", border: "none", color: c.navy, fontSize: 12, cursor: "pointer", padding: 0, marginBottom: 8 }}>
+            Forgot password?
+          </button>
+        )}
 
-        <Button variant="primary" style={{ width: "100%", justifyContent: "center", marginTop: 18 }}>
-          {mode === "signup" ? "Create account" : "Log in"}
+        {error && <p role="alert" style={{ fontSize: 12.5, color: c.red, marginTop: 8 }}>{error}</p>}
+
+        <Button variant="primary" style={{ width: "100%", justifyContent: "center", marginTop: 18, opacity: submitting ? 0.7 : 1 }} disabled={submitting}>
+          {submitting ? "Please wait…" : mode === "signup" ? "Create account" : "Log in"}
         </Button>
       </form>
 
@@ -2959,7 +3051,7 @@ function DashboardView({ account, onBack, publishedArticles, setPublishedArticle
 
   const mockProfile = { name: account?.name || "Your profile", title: account?.title || "Professional", status: "pending", location: account?.location || "Not set", languages: account?.languages || "Not set", initials: (account?.name || "You").split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase() };
   const myArticles = publishedArticles.filter((a) => a.author === (account?.name || mockProfile.name));
-  const myEntry = directory.find((d) => d._ownerEmail && account?.email && d._ownerEmail === account.email) || null;
+  const myEntry = directory.find((d) => d._ownerId && account?.id && d._ownerId === account.id) || null;
 
   return (
     <main style={{ maxWidth: 1080, margin: "0 auto", padding: "32px 24px 80px" }}>
@@ -3333,29 +3425,9 @@ function VerificationFlowDiagram() {
 // actually works is a real bypass no matter how it's commented. Production
 // admin entry is a dedicated authenticated route with real credentials, MFA,
 // and rate limiting — see HEURISKO_PRODUCTION_READINESS.md §1.
-function AdminLoginPanel({ onAuthed }) {
-  return (
-    <div style={{ background: c.navy, borderRadius: 12, padding: 24, maxWidth: 360, marginTop: 20 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-        <ShieldCheck size={16} color={c.gold} />
-        <p style={{ fontFamily: fonts.display, fontSize: 15, color: c.paper, fontWeight: 600 }}>Admin entry (prototype)</p>
-      </div>
-      <p style={{ fontSize: 11.5, color: "#C6CEDA", lineHeight: 1.6, marginBottom: 16 }}>
-        This reveal exists only to demo the admin dashboard's contents in this prototype. There is no working access code here on purpose — a code that actually unlocked anything would be a real security bypass, not a demo. Production admin entry is a separate authenticated route with real credentials, MFA, and rate limiting.
-      </p>
-      <button
-        onClick={onAuthed}
-        title="Prototype only — bypasses real auth, for demo purposes"
-        style={{ width: "100%", fontSize: 12, fontFamily: fonts.mono, color: c.sage, background: "#1E3350", border: `1px dashed ${c.sage}`, borderRadius: 8, padding: "10px 14px", cursor: "pointer" }}
-      >
-        ⚙ Test: enter admin dashboard (prototype only)
-      </button>
-    </div>
-  );
-}
-
 function AboutView() {
   const [tab, setTab] = useState("Public users");
+  const [teamClicks, setTeamClicks] = useState(0);
   const audiences = {
     "Public users": "Search professionals and institutions without creating an account. Filter by speciality, language, location, and consultation mode. Free, and always will be for basic search.",
     "Professionals": "Create a verified profile, manage your own credentials, and connect with people looking for exactly what you offer — not just a generic listing.",
@@ -3413,25 +3485,24 @@ function AboutView() {
         <p style={{ fontSize: 11.5, color: c.navy, fontFamily: fonts.mono }}>PLACEHOLDER — pending real content</p>
       </div>
       <Section title="Team & founding story">
-        <p style={{ fontSize: 13.5, color: c.gray600, lineHeight: 1.7, fontStyle: "italic" }}>
+        {/* A harmless, zero-privilege easter egg — five clicks reveals a bit of
+            fun, nothing more. No hidden route, no privilege, nothing to bypass.
+            Real admin access is a real login + a real account flag, not a
+            click pattern — see README "Making an account an admin." */}
+        <p onClick={() => setTeamClicks((n) => n + 1)} style={{ fontSize: 13.5, color: c.gray600, lineHeight: 1.7, fontStyle: "italic", cursor: "default" }}>
           Space reserved for who's behind Heurisko and why — to be written once we're ready to share it publicly.
         </p>
+        {teamClicks >= 5 && (
+          <p className="h-fade-in-fast" style={{ fontSize: 12.5, color: c.gold, marginTop: 10 }}>
+            🥚 All the king's horses and all the king's men couldn't put our roadmap back together again — but we're giving it a good try. Thanks for clicking around.
+          </p>
+        )}
       </Section>
     </main>
   );
 }
 
-function ContactView({ isAdminAuthed, onAdminAuthed }) {
-  const [redClicks, setRedClicks] = useState(0);
-  const [showAdminLogin, setShowAdminLogin] = useState(false);
-
-  const clickDot = (color) => {
-    if (color !== "red") return;
-    const next = redClicks + 1;
-    setRedClicks(next);
-    if (next >= 5) setShowAdminLogin(true);
-  };
-
+function ContactView() {
   const sections = [
     { icon: <MessageSquare size={16} />, title: "General enquiries", email: "hello@heurisko.example (placeholder)", note: "Questions about the platform, partnerships, or press." },
     { icon: <Users size={16} />, title: "Professional & institution support", email: "partners@heurisko.example (placeholder)", note: "Help with your listing, affiliations, or dashboard." },
@@ -3483,26 +3554,6 @@ function ContactView({ isAdminAuthed, onAdminAuthed }) {
         <textarea rows={4} placeholder="Message" style={{ width: "100%", border: `1px solid ${c.gray300}`, borderRadius: 8, padding: "9px 12px", fontSize: 13, marginBottom: 12, resize: "vertical" }} />
         <Button variant="primary">Send message</Button>
       </div>
-
-      {/* Decorative status row — doubles as a discreet prototype-only admin entry point.
-          Click the red dot five times to reveal the demo entry button below. No numeric
-          code is used anywhere in this flow — see HEURISKO_PRODUCTION_READINESS.md §3
-          for why a hidden UI gesture must never be real access control. */}
-      <div style={{ display: "flex", gap: 8, justifyContent: "center", opacity: 0.5 }}>
-        {["gray300", "navy", "gold", "sage", "red"].map((color) => (
-          <span
-            key={color}
-            onClick={() => clickDot(color === "red" ? "red" : "other")}
-            title="System status"
-            style={{ width: 8, height: 8, borderRadius: "50%", background: c[color] || c.gray300, cursor: "default" }}
-          />
-        ))}
-      </div>
-
-      {showAdminLogin && !isAdminAuthed && <AdminLoginPanel onAuthed={onAdminAuthed} />}
-      {isAdminAuthed && (
-        <p style={{ textAlign: "center", fontSize: 12, color: c.sage, marginTop: 16 }}>Admin session active — an "Admin queue" link is now in the top navigation for the rest of this visit.</p>
-      )}
     </main>
   );
 }
