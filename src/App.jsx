@@ -1,6 +1,7 @@
 import React, { useState } from "react";
-import { Search, MapPin, Video, ArrowRight, Users, Building2, SlidersHorizontal, X, ChevronRight, ArrowLeft, Mail, Clock, GraduationCap, Globe2, Building, MessageSquare, Check, Upload, ShieldCheck, Share2, Copy, MessageCircle, Phone, Calendar, Bell, FileText, Link2, Download, ChevronLeft, Plus, Trash2 } from "lucide-react";
+import { Search, MapPin, Video, ArrowRight, Users, Building2, SlidersHorizontal, X, ChevronRight, ArrowLeft, Mail, Clock, GraduationCap, Globe2, Building, MessageSquare, Check, Upload, ShieldCheck, Share2, Copy, MessageCircle, Phone, Calendar, Bell, FileText, Link2, Download, ChevronLeft, Plus, Trash2, Eye, EyeOff, Menu } from "lucide-react";
 import { supabase } from "./supabaseClient";
+import GlobeSection from "./GlobeSection.jsx";
 
 const c = {
   ink: "#0E1A2B",
@@ -63,18 +64,19 @@ function Chip({ active, children, onClick }) {
   );
 }
 
-function Button({ variant = "primary", children, onClick, style: extra = {}, className = "" }) {
+function Button({ variant = "primary", children, onClick, style: extra = {}, className = "", disabled = false, type }) {
   const base = {
     fontFamily: fonts.body,
     fontSize: 14,
     fontWeight: 600,
     padding: "11px 20px",
     borderRadius: 8,
-    cursor: "pointer",
+    cursor: disabled ? "not-allowed" : "pointer",
     display: "inline-flex",
     alignItems: "center",
     gap: 6,
     border: "none",
+    opacity: disabled ? 0.6 : 1,
   };
   const variants = {
     primary: { background: c.navy, color: c.paper },
@@ -82,8 +84,9 @@ function Button({ variant = "primary", children, onClick, style: extra = {}, cla
     ghost: { background: "transparent", color: c.navy },
   };
   return (
-    <button className={`h-btn-anim ${className}`} style={{ ...base, ...variants[variant], ...extra }} onClick={onClick}>
+    <button type={type} disabled={disabled} className={`h-btn-anim ${className}`} style={{ ...base, ...variants[variant], ...extra }} onClick={onClick}>
       {children}
+
     </button>
   );
 }
@@ -460,6 +463,8 @@ const STORAGE_KEYS = {
   discoveryQueue: "heurisko:discovery-queue",
   articles: "heurisko:published-articles",
   accounts: "heurisko:accounts", // email -> real name, so returning "log in" shows the right name
+  savedItems: "heurisko:saved-items",
+  contactMessages: "heurisko:contact-messages",
 };
 
 async function loadShared(key, fallback) {
@@ -493,6 +498,7 @@ export default function Heurisko() {
   const [account, setAccount] = useState(null); // { id, name, email, role, isAdmin }
   const [authLoaded, setAuthLoaded] = useState(false);
   const [emergencyOpen, setEmergencyOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   // Real Supabase Auth session — replaces the old "type anything, get logged
   // in" fake auth. isAdmin comes from real user_metadata on the Supabase
@@ -509,6 +515,19 @@ export default function Heurisko() {
     };
   };
 
+  // Fixed a real, previously-undetected bug: the onAuthStateChange listener
+  // below is registered once (empty deps, correctly — you don't want to
+  // resubscribe on every render) but was reading `authIntent`/`selected`
+  // directly, which meant it only ever saw their values from the very first
+  // render (a classic stale-closure bug). In practice this meant signing up
+  // via "Join as a professional" silently landed on the homepage instead of
+  // the registration wizard. A ref that's kept current on every render is the
+  // standard fix — the listener reads `intentRef.current`, always fresh.
+  const intentRef = React.useRef({ authIntent, selected });
+  React.useEffect(() => {
+    intentRef.current = { authIntent, selected };
+  }, [authIntent, selected]);
+
   React.useEffect(() => {
     let cancelled = false;
     supabase.auth.getSession().then(({ data }) => {
@@ -518,18 +537,49 @@ export default function Heurisko() {
       setIsLoggedIn(!!acct);
       setAuthLoaded(true);
     });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
       const acct = sessionToAccount(session);
       setAccount(acct);
       setIsLoggedIn(!!acct);
       setAuthLoaded(true);
-      if (acct && (authIntent === "register" || authIntent === "claim")) {
-        setView(authIntent);
+      // Only force navigation on an actual fresh sign-in — not on session
+      // restore at page load or token refresh, which would otherwise yank
+      // someone off whatever page they were already looking at.
+      if (event === "SIGNED_IN" && acct) {
+        const { authIntent: intent, selected: pendingTarget } = intentRef.current;
+        if (intent === "register" || intent === "claim") {
+          setView(intent);
+        } else if (intent === "save" && pendingTarget) {
+          // Complete the save that was interrupted by the login prompt,
+          // rather than silently dropping it — matches what was asked for.
+          const targetId = pendingTarget.id ?? pendingTarget.name;
+          setSavedItems((prev) => {
+            const already = prev.some((s) => s.ownerId === acct.id && s.targetId === targetId);
+            if (already) return prev;
+            return [...prev, {
+              id: Date.now() + Math.random(),
+              ownerId: acct.id,
+              targetId,
+              targetType: pendingTarget.type,
+              targetName: pendingTarget.name,
+              targetTitle: pendingTarget.title,
+              targetStatus: pendingTarget.status,
+              savedAt: new Date().toISOString(),
+            }];
+          });
+          setView("profile");
+        } else {
+          // Plain login/signup with no specific next step. This was a real
+          // bug: previously nothing navigated away from the auth screen for
+          // an ordinary login — the nav bar updated (since it reads account
+          // state directly) but the page content stayed on the login form.
+          setView((v) => (v === "auth" ? "home" : v));
+        }
         setAuthIntent(null);
       }
     });
     return () => { cancelled = true; listener?.subscription?.unsubscribe(); };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
   const isAdminAuthed = account?.isAdmin === true;
 
   // Shared, persisted state — real data, visible to everyone who opens this link.
@@ -540,14 +590,21 @@ export default function Heurisko() {
   const [discoveryQueue, setDiscoveryQueueRaw] = useState([]);
   const [publishedArticles, setPublishedArticlesRaw] = useState([]);
   const [accountsDirectory, setAccountsDirectoryRaw] = useState({}); // email -> real name
+  const [savedItems, setSavedItemsRaw] = useState([]);
+  const [contactMessages, setContactMessagesRaw] = useState([]);
   const [dataLoaded, setDataLoaded] = useState(false);
   const [storageWarning, setStorageWarning] = useState(false);
+
+  // Real ownership check, computed once at the root — a person who already
+  // owns a profile should never see "Join as a professional" again, since
+  // this app only allows one profile per account (see submitForReview).
+  const myOwnedEntry = directory.find((d) => d._ownerId && account?.id && d._ownerId === account.id) || null;
 
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [dir, ext, aq, at, dq, arts, accts] = await Promise.all([
+        const [dir, ext, aq, at, dq, arts, accts, saved, msgs] = await Promise.all([
           loadShared(STORAGE_KEYS.directory, []),
           loadShared(STORAGE_KEYS.external, []),
           loadShared(STORAGE_KEYS.adminQueue, []),
@@ -555,6 +612,8 @@ export default function Heurisko() {
           loadShared(STORAGE_KEYS.discoveryQueue, []),
           loadShared(STORAGE_KEYS.articles, []),
           loadShared(STORAGE_KEYS.accounts, {}),
+          loadShared(STORAGE_KEYS.savedItems, []),
+          loadShared(STORAGE_KEYS.contactMessages, []),
         ]);
         if (cancelled) return;
         setDirectoryRaw(dir);
@@ -564,6 +623,8 @@ export default function Heurisko() {
         setDiscoveryQueueRaw(dq);
         setPublishedArticlesRaw(arts);
         setAccountsDirectoryRaw(accts);
+        setSavedItemsRaw(saved);
+        setContactMessagesRaw(msgs);
       } catch (e) {
         if (!cancelled) setStorageWarning(true);
       } finally {
@@ -585,6 +646,8 @@ export default function Heurisko() {
       [STORAGE_KEYS.discoveryQueue]: (v) => setDiscoveryQueueRaw(v ?? []),
       [STORAGE_KEYS.articles]: (v) => setPublishedArticlesRaw(v ?? []),
       [STORAGE_KEYS.accounts]: (v) => setAccountsDirectoryRaw(v ?? {}),
+      [STORAGE_KEYS.savedItems]: (v) => setSavedItemsRaw(v ?? []),
+      [STORAGE_KEYS.contactMessages]: (v) => setContactMessagesRaw(v ?? []),
     };
     const channel = supabase
       .channel("heurisko-kv-changes")
@@ -606,6 +669,8 @@ export default function Heurisko() {
   const setDiscoveryQueue = (updater) => setDiscoveryQueueRaw((prev) => { const next = typeof updater === "function" ? updater(prev) : updater; saveShared(STORAGE_KEYS.discoveryQueue, next); return next; });
   const setPublishedArticles = (updater) => setPublishedArticlesRaw((prev) => { const next = typeof updater === "function" ? updater(prev) : updater; saveShared(STORAGE_KEYS.articles, next); return next; });
   const setAccountsDirectory = (updater) => setAccountsDirectoryRaw((prev) => { const next = typeof updater === "function" ? updater(prev) : updater; saveShared(STORAGE_KEYS.accounts, next); return next; });
+  const setSavedItems = (updater) => setSavedItemsRaw((prev) => { const next = typeof updater === "function" ? updater(prev) : updater; saveShared(STORAGE_KEYS.savedItems, next); return next; });
+  const setContactMessages = (updater) => setContactMessagesRaw((prev) => { const next = typeof updater === "function" ? updater(prev) : updater; saveShared(STORAGE_KEYS.contactMessages, next); return next; });
 
   const submitForReview = (entry) => {
     const id = Date.now() + Math.random();
@@ -661,6 +726,40 @@ export default function Heurisko() {
     setDirectory((prev) => prev.map((d) => (d.id === id ? { ...d, flaggedForReview: !d.flaggedForReview } : d)));
   };
 
+  // Real Saved Items — was a no-op button before. Requires login; if not
+  // logged in, routes through auth like register/claim do, then completes
+  // the save automatically once signed in (matches what was asked for: the
+  // action resumes after authentication, not silently dropped).
+  const toggleSaveItem = (r) => {
+    if (!isLoggedIn) {
+      setSelected(r);
+      setAuthIntent("save");
+      setView("auth");
+      return;
+    }
+    const targetId = r.id ?? r.name; // external listings currently have no stable id
+    const existing = savedItems.find((s) => s.ownerId === account.id && s.targetId === targetId);
+    if (existing) {
+      setSavedItems((prev) => prev.filter((s) => s.id !== existing.id));
+    } else {
+      setSavedItems((prev) => [...prev, {
+        id: Date.now() + Math.random(),
+        ownerId: account.id,
+        targetId,
+        targetType: r.type,
+        targetName: r.name,
+        targetTitle: r.title,
+        targetStatus: r.status,
+        savedAt: new Date().toISOString(),
+      }]);
+    }
+  };
+  const isSaved = (r) => {
+    if (!isLoggedIn) return false;
+    const targetId = r.id ?? r.name;
+    return savedItems.some((s) => s.ownerId === account.id && s.targetId === targetId);
+  };
+
   const toggleCat = (cat) =>
     setActiveCats((prev) => (prev.includes(cat) ? prev.filter((x) => x !== cat) : [...prev, cat]));
 
@@ -675,6 +774,7 @@ export default function Heurisko() {
   };
 
   const goRegister = () => {
+    if (myOwnedEntry) { setView("dashboard"); return; }
     if (isLoggedIn) setView("register");
     else {
       setAuthIntent("register");
@@ -758,6 +858,7 @@ export default function Heurisko() {
           .h-grid-2, .h-grid-3, .h-grid-3-tight { grid-template-columns: 1fr; }
           .h-hero-title { font-size: 32px !important; }
           .h-nav-links { display: none !important; }
+          .h-mobile-menu-btn { display: flex !important; }
         }
       `}</style>
 
@@ -769,8 +870,11 @@ export default function Heurisko() {
             style={{ fontFamily: fonts.display, fontSize: 22, fontWeight: 600, color: c.navy, cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}
           >
             <svg width="30" height="30" viewBox="0 0 100 100">
-              <circle cx="50" cy="50" r="46" fill="#FFFFFF" stroke="#111111" strokeWidth="3" />
-              <text x="50" y="66" textAnchor="middle" fontFamily={fonts.body} fontWeight="700" fontSize="52" fill="#111111">ε</text>
+              <circle cx="50" cy="50" r="45" fill="#FFFFFF" stroke="#111111" strokeWidth="3" />
+              <path
+                d="M 67,30 C 55,22 37,24 34,35 C 32,43 38,49 49,50 C 38,51 32,57 34,65 C 37,76 55,78 67,70"
+                fill="none" stroke="#111111" strokeWidth="8.5" strokeLinecap="round" strokeLinejoin="round"
+              />
             </svg>
             Heurisko
           </div>
@@ -778,6 +882,9 @@ export default function Heurisko() {
             <span style={{ cursor: "pointer" }} onClick={() => setView("about")}>About</span>
             <span style={{ cursor: "pointer" }} onClick={() => setView("resources")}>Resources</span>
             <span style={{ cursor: "pointer" }} onClick={() => setView("contact")}>Contact</span>
+            {isLoggedIn && (
+              <span style={{ cursor: "pointer" }} onClick={() => setView("saved")}>Saved{savedItems.filter((s) => s.ownerId === account?.id).length > 0 ? ` (${savedItems.filter((s) => s.ownerId === account?.id).length})` : ""}</span>
+            )}
             {isLoggedIn && account?.role === "professional" && (
               <span style={{ cursor: "pointer", color: c.navy, fontWeight: 600 }} onClick={() => setView("dashboard")}>Dashboard</span>
             )}
@@ -785,8 +892,23 @@ export default function Heurisko() {
               <span style={{ cursor: "pointer", color: c.gold, fontWeight: 600 }} onClick={() => setView("admin")}>Admin queue</span>
             )}
           </nav>
+          <button
+            className="h-mobile-menu-btn"
+            onClick={() => setMobileMenuOpen((o) => !o)}
+            aria-label={mobileMenuOpen ? "Close menu" : "Open menu"}
+            aria-expanded={mobileMenuOpen}
+            style={{ display: "none", background: "none", border: `1px solid ${c.gray300}`, borderRadius: 8, padding: 8, cursor: "pointer", color: c.navy, alignItems: "center", justifyContent: "center" }}
+          >
+            {mobileMenuOpen ? <X size={18} /> : <Menu size={18} />}
+          </button>
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <Button variant="secondary" style={{ padding: "9px 16px" }} onClick={goRegister}>Join as a professional</Button>
+            <Button
+              variant="secondary"
+              style={{ padding: "9px 16px" }}
+              onClick={goRegister}
+            >
+              {myOwnedEntry ? "Professional dashboard" : "Join as a professional"}
+            </Button>
             {isLoggedIn ? (
               <>
                 <div style={{ width: 32, height: 32, borderRadius: "50%", background: c.navyTint, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.display, fontWeight: 600, fontSize: 13, color: c.navy }}>
@@ -800,6 +922,52 @@ export default function Heurisko() {
           </div>
         </div>
       </header>
+
+      {mobileMenuOpen && (
+        <nav
+          className="h-mobile-menu-panel"
+          aria-label="Mobile navigation"
+          style={{ background: c.paper, borderBottom: `1px solid ${c.gray300}`, padding: "8px 24px 16px", display: "flex", flexDirection: "column", gap: 4 }}
+        >
+          {[
+            { label: "About", go: "about" },
+            { label: "Resources", go: "resources" },
+            { label: "Contact", go: "contact" },
+          ].map((item) => (
+            <button
+              key={item.go}
+              onClick={() => { setView(item.go); setMobileMenuOpen(false); }}
+              style={{ textAlign: "left", background: "none", border: "none", padding: "10px 4px", fontSize: 14, fontWeight: 500, color: c.gray600, cursor: "pointer" }}
+            >
+              {item.label}
+            </button>
+          ))}
+          {isLoggedIn && (
+            <button
+              onClick={() => { setView("saved"); setMobileMenuOpen(false); }}
+              style={{ textAlign: "left", background: "none", border: "none", padding: "10px 4px", fontSize: 14, fontWeight: 500, color: c.gray600, cursor: "pointer" }}
+            >
+              Saved
+            </button>
+          )}
+          {isLoggedIn && account?.role === "professional" && (
+            <button
+              onClick={() => { setView("dashboard"); setMobileMenuOpen(false); }}
+              style={{ textAlign: "left", background: "none", border: "none", padding: "10px 4px", fontSize: 14, fontWeight: 600, color: c.navy, cursor: "pointer" }}
+            >
+              Dashboard
+            </button>
+          )}
+          {isAdminAuthed && (
+            <button
+              onClick={() => { setView("admin"); setMobileMenuOpen(false); }}
+              style={{ textAlign: "left", background: "none", border: "none", padding: "10px 4px", fontSize: 14, fontWeight: 600, color: c.gold, cursor: "pointer" }}
+            >
+              Admin queue
+            </button>
+          )}
+        </nav>
+      )}
 
       {!dataLoaded ? (
         <main style={{ maxWidth: 600, margin: "0 auto", padding: "120px 24px", textAlign: "center" }}>
@@ -815,6 +983,8 @@ export default function Heurisko() {
         />
       ) : view === "resources" ? (
         <ResourcesView publishedArticles={publishedArticles} />
+      ) : view === "saved" ? (
+        <SavedView savedItems={savedItems.filter((s) => s.ownerId === account?.id)} directory={directory} externalListings={externalListings} onOpenProfile={openProfile} onRemove={(id) => setSavedItems((prev) => prev.filter((s) => s.id !== id))} />
       ) : view === "search" ? (
         <SearchView
           activeCats={activeCats}
@@ -829,7 +999,15 @@ export default function Heurisko() {
         selected?.status === "external" ? (
           <ExternalProfileView r={selected} onBack={() => setView("search")} onClaim={goClaim} />
         ) : (
-          <ProfileView r={selected} onBack={() => setView("search")} onClaim={goClaim} isLoggedIn={isLoggedIn} account={account} />
+          <ProfileView
+            r={selected}
+            onBack={() => setView("search")}
+            onClaim={goClaim}
+            isLoggedIn={isLoggedIn}
+            account={account}
+            onToggleSave={toggleSaveItem}
+            isSaved={selected ? isSaved(selected) : false}
+          />
         )
       ) : view === "auth" ? (
         <AuthView
@@ -866,6 +1044,7 @@ export default function Heurisko() {
             onToggleFlag={toggleDirectoryEntryFlag}
             discoveryQueue={discoveryQueue}
             setDiscoveryQueue={setDiscoveryQueue}
+            adminIdentity={account?.email || "unknown admin"}
             onExit={() => setView("home")}
           />
         ) : (
@@ -984,6 +1163,12 @@ function HomeView({ activeCats, toggleCat, onSearch, onResources }) {
         </form>
       </section>
 
+      <GlobeSection
+        c={c}
+        fonts={fonts}
+        onLocationPick={(loc) => setLocation(loc.country ? `${loc.name}, ${loc.country}` : loc.name)}
+      />
+
       {/* QUICK CATEGORIES */}
       <section style={{ marginBottom: 56 }}>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
@@ -1073,6 +1258,7 @@ function SearchView({ activeCats, toggleCat, initialQuery, onBack, onOpenProfile
 
   const shown = pool
     .filter((r) => !r.hidden)
+    .filter((r) => r.status !== "rejected") // explicit, independent of the hidden flag
     .filter((r) => (sourceFilter === "Heurisko Verified" ? r.status === "verified" : true))
     .filter((r) => (sourceFilter === "Registered" ? r.status === "pending" || r.status === "unclaimed" : true))
     .filter((r) => (verifiedOnly ? r.status === "verified" : true))
@@ -1240,6 +1426,38 @@ function TextField({ label, required, area, placeholder, hint, value, onChange, 
   );
 }
 
+// Reusable across every password field in the app (signup, login, reset) —
+// toggling visibility never clears the typed value or loses cursor position,
+// since it only swaps the input's `type` attribute, nothing else.
+function PasswordField({ label, value, onChange, placeholder, id }) {
+  const [visible, setVisible] = useState(false);
+  const fieldId = id || `pw-${label?.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "field"}`;
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <label htmlFor={fieldId} style={{ display: "block", fontSize: 13, fontWeight: 500, color: c.ink, marginBottom: 6 }}>{label}</label>
+      <div style={{ position: "relative" }}>
+        <input
+          id={fieldId}
+          type={visible ? "text" : "password"}
+          value={value}
+          onChange={onChange}
+          placeholder={placeholder}
+          style={{ width: "100%", border: `1px solid ${c.gray300}`, borderRadius: 8, padding: "10px 40px 10px 12px", fontFamily: fonts.body, fontSize: 14 }}
+        />
+        <button
+          type="button"
+          onClick={() => setVisible((v) => !v)}
+          aria-label={visible ? "Hide password" : "Show password"}
+          aria-pressed={visible}
+          style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: c.gray600, padding: 4, display: "flex" }}
+        >
+          {visible ? <EyeOff size={16} /> : <Eye size={16} />}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 const PRO_STEPS = ["Account type", "Basic info", "Credentials", "Services", "Review"];
 
 function AuthView({ intent, claimTarget, onCancel }) {
@@ -1378,10 +1596,7 @@ function AuthView({ intent, claimTarget, onCancel }) {
           <label style={{ display: "block", fontSize: 13, fontWeight: 500, color: c.ink, marginBottom: 6 }}>Email</label>
           <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" style={{ width: "100%", border: `1px solid ${c.gray300}`, borderRadius: 8, padding: "10px 12px", fontFamily: fonts.body, fontSize: 14 }} />
         </div>
-        <div style={{ marginBottom: 8 }}>
-          <label style={{ display: "block", fontSize: 13, fontWeight: 500, color: c.ink, marginBottom: 6 }}>Password</label>
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 8 characters" style={{ width: "100%", border: `1px solid ${c.gray300}`, borderRadius: 8, padding: "10px 12px", fontFamily: fonts.body, fontSize: 14 }} />
-        </div>
+        <PasswordField label="Password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 8 characters" />
 
         {mode === "login" && (
           <button type="button" onClick={sendPasswordReset} style={{ background: "none", border: "none", color: c.navy, fontSize: 12, cursor: "pointer", padding: 0, marginBottom: 8 }}>
@@ -1592,13 +1807,37 @@ function RegisterView({ onBack, onSubmitForReview }) {
     }, 1400);
   };
 
+  const [stepError, setStepError] = useState("");
+
+  // Real validation, finally — this was a genuine gap: every step could be
+  // skipped entirely with nothing filled in, and the fallback silently
+  // created a listing literally named "Unnamed professional."
+  const validateStep = () => {
+    if (step === 1 && (!fullName.trim() || !title.trim() || !primaryLocation.trim())) {
+      return "Full name, title, and primary location are required before continuing.";
+    }
+    if (step === 2 && (!licensingAuthority.trim() || !licenceNumber.trim())) {
+      return "Licensing authority and licence number are required before continuing.";
+    }
+    if (step === 3 && (!specialities.trim() || !languages.trim())) {
+      return "Areas of speciality and languages spoken are required before continuing.";
+    }
+    return "";
+  };
+
   const next = () => {
+    const err = validateStep();
+    if (err) {
+      setStepError(err);
+      return;
+    }
+    setStepError("");
     if (step < PRO_STEPS.length - 1) {
       setStep(step + 1);
       return;
     }
     const passed = extraction && extraction.score >= 75;
-    const displayName = fullName || (accountType === "professional" ? "Unnamed professional" : "Unnamed institution");
+    const displayName = fullName.trim();
     const initials = displayName.split(" ").filter((w) => w && w[0] === w[0].toUpperCase()).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || displayName.slice(0, 2).toUpperCase();
     const concernsList = specialities.split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -1632,7 +1871,11 @@ function RegisterView({ onBack, onSubmitForReview }) {
     }
     setSubmitted(true);
   };
-  const back = () => (step > 0 ? setStep(step - 1) : onBack());
+  const back = () => {
+    setStepError("");
+    if (step > 0) setStep(step - 1);
+    else onBack();
+  };
 
   if (submitted) {
     const passed = extraction && extraction.score >= 75;
@@ -1791,8 +2034,9 @@ function RegisterView({ onBack, onSubmitForReview }) {
             </>
           )}
 
-          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 28, paddingTop: 20, borderTop: `1px solid ${c.gray300}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 28, paddingTop: 20, borderTop: `1px solid ${c.gray300}`, flexWrap: "wrap", gap: 10 }}>
             <Button variant="ghost" onClick={back}>Back</Button>
+            {stepError && <p role="alert" style={{ fontSize: 12.5, color: c.red, margin: 0, flex: "1 1 200px" }}>{stepError}</p>}
             <Button variant="primary" onClick={next}>{step === PRO_STEPS.length - 1 ? "Submit for review" : "Continue"}</Button>
           </div>
         </div>
@@ -2026,10 +2270,34 @@ function drawShareCard(canvas, r, isInstitution, url) {
     ctx.stroke();
   }
 
-  // Heurisko wordmark
+  // Heurisko wordmark — same hand-drawn epsilon path as the real logo/favicon,
+  // not a separate text glyph. This was a real inconsistency: the two used to
+  // look like different marks depending on where you saw them.
+  ctx.save();
+  ctx.translate(40, 34);
+  ctx.scale(0.24, 0.24);
+  ctx.beginPath();
+  ctx.arc(50, 50, 45, 0, Math.PI * 2);
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fill();
+  ctx.lineWidth = 13;
+  ctx.strokeStyle = "#C9A461";
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(67, 30);
+  ctx.bezierCurveTo(55, 22, 37, 24, 34, 35);
+  ctx.bezierCurveTo(32, 43, 38, 49, 49, 50);
+  ctx.bezierCurveTo(38, 51, 32, 57, 34, 65);
+  ctx.bezierCurveTo(37, 76, 55, 78, 67, 70);
+  ctx.lineWidth = 36;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.stroke();
+  ctx.restore();
+
   ctx.fillStyle = "#C9A461";
   ctx.font = "600 20px Georgia, serif";
-  ctx.fillText("ε Heurisko", 40, 56);
+  ctx.fillText("Heurisko", 70, 56);
 
   // avatar circle
   ctx.fillStyle = "#25405F";
@@ -2120,7 +2388,13 @@ function ShareModal({ r, isInstitution, onClose }) {
   const canvasRef = React.useRef(null);
   useModalA11y(onClose);
   const slug = r.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
-  const url = `heurisko.com/${isInstitution ? "i" : "p"}/${slug}`;
+  // Real deployed origin, not a hardcoded fake domain — this was a genuine bug:
+  // shared links pointed at "heurisko.com", a domain this app has never
+  // actually been deployed to. There's also no real per-profile routing yet
+  // (see README), so this link currently opens the homepage, not the specific
+  // profile — flagged honestly in the modal below rather than silently implied.
+  const origin = typeof window !== "undefined" ? window.location.origin.replace(/^https?:\/\//, "") : "your-deployed-site";
+  const url = `${origin}/${isInstitution ? "i" : "p"}/${slug}`;
   const shareText = `${r.name} — ${r.title} on Heurisko`;
 
   React.useEffect(() => {
@@ -2195,6 +2469,9 @@ function ShareModal({ r, isInstitution, onClose }) {
             This profile is currently {r.status === "pending" ? "pending verification" : "unclaimed"} — the shared card and link will always reflect its current status, not this moment.
           </p>
         )}
+        <p style={{ fontSize: 11, color: c.gray600, marginTop: 10, lineHeight: 1.6 }}>
+          This pilot doesn't have per-profile page routing yet — the link above currently opens the homepage, not this specific profile directly. The downloaded card image is accurate regardless.
+        </p>
       </div>
     </div>
   );
@@ -2383,7 +2660,7 @@ function ExternalProfileView({ r, onBack, onClaim }) {
   );
 }
 
-function ProfileView({ r, onBack, onClaim, isLoggedIn, account }) {
+function ProfileView({ r, onBack, onClaim, isLoggedIn, account, onToggleSave, isSaved }) {
   const [shareOpen, setShareOpen] = useState(false);
   const [enquiryOpen, setEnquiryOpen] = useState(false);
   if (!r) return null;
@@ -2427,8 +2704,12 @@ function ProfileView({ r, onBack, onClaim, isLoggedIn, account }) {
           <Button variant="secondary" style={{ background: "transparent", color: c.paper, border: "1px solid #3A4E68" }} onClick={() => setShareOpen(true)}>
             <Share2 size={14} /> Share profile
           </Button>
-          <Button variant="secondary" style={{ background: "transparent", color: c.paper, border: "1px solid #3A4E68" }}>
-            Save profile
+          <Button
+            variant="secondary"
+            style={{ background: isSaved ? c.gold : "transparent", color: isSaved ? c.ink : c.paper, border: "1px solid #3A4E68" }}
+            onClick={() => onToggleSave(r)}
+          >
+            <Check size={14} style={{ opacity: isSaved ? 1 : 0 }} /> {isSaved ? "Saved" : "Save profile"}
           </Button>
         </div>
       </div>
@@ -2989,6 +3270,60 @@ function ExpertArticles({ articles }) {
   );
 }
 
+function SavedView({ savedItems, directory, externalListings, onOpenProfile, onRemove }) {
+  const resolveTarget = (saved) => {
+    // Prefer the live directory/external record if it still exists (so the
+    // saved entry reflects current status, not what it was when saved) —
+    // fall back to the snapshot stored at save-time if the profile was since
+    // deleted, so the person still sees what they saved rather than nothing.
+    const live = directory.find((d) => d.id === saved.targetId) || externalListings.find((e) => (e.id ?? e.name) === saved.targetId);
+    if (live) return live;
+    return { id: saved.targetId, name: saved.targetName, title: saved.targetTitle, status: saved.targetStatus, type: saved.targetType, location: "", languages: "", modes: [], concerns: [] };
+  };
+
+  return (
+    <main style={{ maxWidth: 900, margin: "0 auto", padding: "32px 24px 100px" }}>
+      <h1 style={{ fontFamily: fonts.display, fontSize: 28, color: c.ink, marginBottom: 6, fontWeight: 500 }}>Saved</h1>
+      <p style={{ fontSize: 13.5, color: c.gray600, marginBottom: 24 }}>Profiles you've saved for later — private to your account.</p>
+
+      {savedItems.length === 0 ? (
+        <p style={{ fontSize: 13.5, color: c.gray600 }}>You haven't saved any profiles yet — look for the "Save profile" button on any professional or institution page.</p>
+      ) : (
+        <div className="h-grid-2">
+          {savedItems.map((saved) => {
+            const target = resolveTarget(saved);
+            const stillExists = !!(directory.find((d) => d.id === saved.targetId) || externalListings.find((e) => (e.id ?? e.name) === saved.targetId));
+            return (
+              <div key={saved.id} className="h-card-hover" style={{ background: c.paper, border: `1px solid ${c.gray300}`, borderRadius: 12, padding: 18 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 8 }}>
+                  <div>
+                    <p style={{ fontSize: 15, fontWeight: 600, color: c.ink }}>{target.name}</p>
+                    <p style={{ fontSize: 12.5, color: c.gray600 }}>{target.title}</p>
+                  </div>
+                  <StatusMark status={target.status} size={14} />
+                </div>
+                {!stillExists && <p style={{ fontSize: 11.5, color: c.red, marginBottom: 8 }}>This profile is no longer available.</p>}
+                <div style={{ display: "flex", gap: 8 }}>
+                  {stillExists && (
+                    <Button variant="secondary" style={{ padding: "7px 14px", fontSize: 12.5 }} onClick={() => onOpenProfile(target)}>View profile</Button>
+                  )}
+                  <button
+                    onClick={() => onRemove(saved.id)}
+                    aria-label={`Remove ${target.name} from saved`}
+                    style={{ fontSize: 12.5, color: c.gray600, background: "none", border: `1px solid ${c.gray300}`, borderRadius: 8, padding: "7px 14px", cursor: "pointer" }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </main>
+  );
+}
+
 function ResourcesView({ publishedArticles }) {
   const [tab, setTab] = useState("Breathing");
   return (
@@ -3047,18 +3382,21 @@ function DashboardView({ account, onBack, publishedArticles, setPublishedArticle
     { id: "enquiries", label: `Enquiries${unread ? ` (${unread})` : ""}` },
     { id: "articles", label: "Articles & publications" },
     { id: "share", label: "Share card" },
+    { id: "account", label: "Account" },
   ];
 
-  const mockProfile = { name: account?.name || "Your profile", title: account?.title || "Professional", status: "pending", location: account?.location || "Not set", languages: account?.languages || "Not set", initials: (account?.name || "You").split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase() };
-  const myArticles = publishedArticles.filter((a) => a.author === (account?.name || mockProfile.name));
+  // Real owned profile — used for the greeting name and the share card. Falls
+  // back to bare account info only when no profile has been registered yet.
   const myEntry = directory.find((d) => d._ownerId && account?.id && d._ownerId === account.id) || null;
+  const displayName = myEntry?.name || account?.name || "Your profile";
+  const myArticles = publishedArticles.filter((a) => a.author === (account?.name || displayName));
 
   return (
     <main style={{ maxWidth: 1080, margin: "0 auto", padding: "32px 24px 80px" }}>
       <button onClick={onBack} style={{ background: "none", border: "none", color: c.gray600, fontSize: 13, marginBottom: 16, cursor: "pointer", fontFamily: fonts.body, display: "flex", alignItems: "center", gap: 6 }}>
         <ArrowLeft size={14} /> Exit dashboard
       </button>
-      <h1 style={{ fontFamily: fonts.display, fontSize: 28, color: c.ink, marginBottom: 4, fontWeight: 500 }}>Welcome back, {mockProfile.name.split(" ")[0]}</h1>
+      <h1 style={{ fontFamily: fonts.display, fontSize: 28, color: c.ink, marginBottom: 4, fontWeight: 500 }}>Welcome back, {displayName.split(" ")[0]}</h1>
       <p style={{ fontSize: 13.5, color: c.gray600, marginBottom: 24 }}>Manage your calendar, enquiries, and published content from here.</p>
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 24 }}>
@@ -3071,10 +3409,71 @@ function DashboardView({ account, onBack, publishedArticles, setPublishedArticle
         {tab === "overview" && <DashboardOverview appointments={appointments} enquiries={enquiries} onGo={setTab} myEntry={myEntry} onDeleteProfile={onDeleteProfile} />}
         {tab === "calendar" && <DashboardCalendar appointments={appointments} setAppointments={setAppointments} />}
         {tab === "enquiries" && <DashboardEnquiries enquiries={enquiries} setEnquiries={setEnquiries} />}
-        {tab === "articles" && <DashboardArticles articles={myArticles} authorName={account?.name || mockProfile.name} setPublishedArticles={setPublishedArticles} />}
-        {tab === "share" && <DashboardShare profile={mockProfile} />}
+        {tab === "articles" && <DashboardArticles articles={myArticles} authorName={account?.name || displayName} setPublishedArticles={setPublishedArticles} />}
+        {tab === "share" && (
+          myEntry
+            ? <DashboardShare profile={myEntry} />
+            : <p style={{ fontSize: 13.5, color: c.gray600, padding: "20px 0" }}>Register a profile first — the share card is built from your real published profile, not a placeholder.</p>
+        )}
+        {tab === "account" && <DashboardAccount account={account} />}
       </div>
     </main>
+  );
+}
+
+function DashboardAccount({ account }) {
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [status, setStatus] = useState(""); // "" | "saving" | "success" | error message
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!newPassword || newPassword.length < 8) {
+      setStatus("Password must be at least 8 characters.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setStatus("Passwords don't match.");
+      return;
+    }
+    setStatus("saving");
+    // Real password change against the current authenticated session — this
+    // is a genuine gap the audit correctly found: there was no way to change
+    // your password once logged in, only the "forgot password" reset email.
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) {
+      setStatus(error.message || "Couldn't update your password.");
+    } else {
+      setStatus("success");
+      setNewPassword("");
+      setConfirmPassword("");
+    }
+  };
+
+  return (
+    <div style={{ maxWidth: 420 }}>
+      <div style={{ background: c.paper, border: `1px solid ${c.gray300}`, borderRadius: 12, padding: 20, marginBottom: 20 }}>
+        <p style={{ fontSize: 13, fontWeight: 600, color: c.ink, marginBottom: 4 }}>Signed in as</p>
+        <p style={{ fontSize: 13.5, color: c.gray600 }}>{account?.email}</p>
+      </div>
+
+      <div style={{ background: c.paper, border: `1px solid ${c.gray300}`, borderRadius: 12, padding: 20 }}>
+        <p style={{ fontSize: 13, fontWeight: 600, color: c.ink, marginBottom: 14 }}>Change password</p>
+        <form onSubmit={submit}>
+          <PasswordField label="New password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="At least 8 characters" />
+          <PasswordField label="Confirm new password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} placeholder="Re-enter the same password" />
+          {status && status !== "saving" && status !== "success" && (
+            <p role="alert" style={{ fontSize: 12.5, color: c.red, marginBottom: 10 }}>{status}</p>
+          )}
+          {status === "success" && (
+            <p role="status" style={{ fontSize: 12.5, color: c.sage, marginBottom: 10 }}>Password updated.</p>
+          )}
+          <Button variant="primary" disabled={status === "saving"} style={{ width: "100%", justifyContent: "center" }}>
+            {status === "saving" ? "Updating…" : "Update password"}
+          </Button>
+        </form>
+      </div>
+    </div>
   );
 }
 
@@ -3338,7 +3737,10 @@ function DashboardArticles({ articles, authorName, setPublishedArticles }) {
 function DashboardShare({ profile }) {
   const canvasRef = React.useRef(null);
   React.useEffect(() => {
-    if (canvasRef.current) drawShareCard(canvasRef.current, profile, false, `heurisko.com/p/${profile.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+    if (canvasRef.current) {
+      const origin = typeof window !== "undefined" ? window.location.origin.replace(/^https?:\/\//, "") : "your-deployed-site";
+      drawShareCard(canvasRef.current, profile, profile.type === "institution", `${origin}/p/${profile.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
+    }
   }, [profile]);
 
   const download = () => {
@@ -3699,11 +4101,15 @@ function DirectoryManagement({ directory, onDelete, onSetVisibility, onToggleFla
   );
 }
 
-function AdminView({ queue, setQueue, auditTrail, setAuditTrail, directory, setDirectory, onDeleteDirectoryEntry, onSetVisibility, onToggleFlag, discoveryQueue, setDiscoveryQueue, onExit }) {
+function AdminView({ queue, setQueue, auditTrail, setAuditTrail, directory, setDirectory, onDeleteDirectoryEntry, onSetVisibility, onToggleFlag, discoveryQueue, setDiscoveryQueue, adminIdentity, onExit }) {
   const [openItem, setOpenItem] = useState(null);
   const [tab, setTab] = useState("queue");
 
-  const sorted = [...queue].sort((a, b) => {
+  // A decided case (approved or rejected) leaves the active queue — it's still
+  // fully visible in "All profiles" below, just not cluttering the list of
+  // things that actually need an admin's attention right now.
+  const activeQueue = queue.filter((q) => q.status !== "verified" && q.status !== "rejected");
+  const sorted = [...activeQueue].sort((a, b) => {
     if (a.status === "flagged" && b.status !== "flagged") return -1;
     if (b.status === "flagged" && a.status !== "flagged") return 1;
     return (a.autoScore ?? 0) - (b.autoScore ?? 0);
@@ -3716,12 +4122,15 @@ function AdminView({ queue, setQueue, auditTrail, setAuditTrail, directory, setD
       setDirectory((prev) => prev.map((d) => (d._queueId === item.id ? { ...d, status: "verified" } : d)));
     }
     if (actionId === "reject") {
-      // A rejected submission comes out of public search entirely rather than sitting
-      // visible with a confusing status — the person can re-submit if they correct it.
-      setDirectory((prev) => prev.filter((d) => d._queueId !== item.id));
+      // Fixed a real inconsistency: this used to delete the entry outright,
+      // which meant a rejected case silently vanished from "All profiles" too
+      // — contradicting the promise that decided cases stay visible there.
+      // Now it's marked rejected + hidden from public search, but still a
+      // real, inspectable record admins can see.
+      setDirectory((prev) => prev.map((d) => (d._queueId === item.id ? { ...d, status: "rejected", hidden: true } : d)));
     }
     setAuditTrail((prev) => [
-      { id: Date.now(), timestamp: new Date().toISOString().slice(0, 16).replace("T", " "), admin: "Prototype Admin Session", action: ADMIN_ACTIONS.find((a) => a.id === actionId).label, target: item.name },
+      { id: Date.now(), timestamp: new Date().toISOString().slice(0, 16).replace("T", " "), admin: adminIdentity, action: ADMIN_ACTIONS.find((a) => a.id === actionId).label, target: item.name },
       ...prev,
     ]);
     setOpenItem(null);
@@ -3736,7 +4145,7 @@ function AdminView({ queue, setQueue, auditTrail, setAuditTrail, directory, setD
       setDiscoveryQueue((prev) => prev.map((d) => (d.id === item.id ? { ...d, lastChecked: new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }), freshness: "current" } : d)));
     }
     setAuditTrail((prev) => [
-      { id: Date.now(), timestamp: new Date().toISOString().slice(0, 16).replace("T", " "), admin: "Prototype Admin Session", action: `${action} (external discovery)`, target: item.name },
+      { id: Date.now(), timestamp: new Date().toISOString().slice(0, 16).replace("T", " "), admin: adminIdentity, action: `${action} (external discovery)`, target: item.name },
       ...prev,
     ]);
   };
@@ -3773,7 +4182,7 @@ function AdminView({ queue, setQueue, auditTrail, setAuditTrail, directory, setD
       </div>
 
       <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
-        <Chip active={tab === "queue"} onClick={() => setTab("queue")}>Queue</Chip>
+        <Chip active={tab === "queue"} onClick={() => setTab("queue")}>Queue ({activeQueue.length})</Chip>
         <Chip active={tab === "directory"} onClick={() => setTab("directory")}>All profiles ({directory.length})</Chip>
         <Chip active={tab === "discovery"} onClick={() => setTab("discovery")}>External Directory Discovery</Chip>
         <Chip active={tab === "audit"} onClick={() => setTab("audit")}>Audit trail</Chip>
@@ -3786,7 +4195,7 @@ function AdminView({ queue, setQueue, auditTrail, setAuditTrail, directory, setD
           onSetVisibility={onSetVisibility}
           onToggleFlag={onToggleFlag}
           logAction={(action, target) => setAuditTrail((prev) => [
-            { id: Date.now(), timestamp: new Date().toISOString().slice(0, 16).replace("T", " "), admin: "Prototype Admin Session", action, target },
+            { id: Date.now(), timestamp: new Date().toISOString().slice(0, 16).replace("T", " "), admin: adminIdentity, action, target },
             ...prev,
           ])}
         />
